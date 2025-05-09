@@ -108,8 +108,8 @@ datasets_models = {
     }
 }
 
-cv_fold_results = []  # Store fold-level metrics
-cv_aggregated_results = []  # Store aggregated metrics
+cv_fold_results = []  
+
 test_results = []
 
 for outcome, paths in datasets_models.items():
