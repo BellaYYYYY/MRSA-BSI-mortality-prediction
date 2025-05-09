@@ -23,7 +23,6 @@ class DataFrameConverter(BaseEstimator, TransformerMixin):
         return self
 
     def transform(self, X):
-        # Convert numpy array to DataFrame with the specified columns
         return pd.DataFrame(X, columns=self.columns)
 
 def gen_performance_metrics(y_true, y_preds, probabilities, model_name, round_to=3):
@@ -47,20 +46,20 @@ def get_model_features(model, X_test):
     else:
         return list(X_test.columns)
 
-# Function to load XGBoost models safely
+
 def load_model_safely(model_path, model_type):
     if model_type == "xgb":
         try:
-            # Try loading the model using XGBoost's Booster class
+
             model = Booster()
             model.load_model(model_path)
             print(f"Loaded XGBoost model using Booster from {model_path}")
         except Exception:
-            # Fallback to joblib if Booster fails
+
             model = load(model_path)
             print(f"Loaded XGBoost model using joblib from {model_path}")
     else:
-        # For non-XGBoost models, use joblib
+
         model = load(model_path)
     return model
 
@@ -116,7 +115,7 @@ for outcome, paths in datasets_models.items():
     print(f"\nProcessing outcome: {outcome}")
     target_column = paths["target_column"]
 
-    # Load train and test datasets
+
     train_df = pd.read_csv(paths["train_data_path"])
     test_df = pd.read_csv(paths["test_data_path"])
     y_train = train_df[target_column]
@@ -158,8 +157,6 @@ for outcome, paths in datasets_models.items():
 
         cv_fold_results.extend(fold_metrics)
 
-
-        # Test set evaluation
         if hasattr(model, "predict_proba"):
             y_test_prob = model.predict_proba(X_test)[:, 1]
         else:
@@ -171,12 +168,12 @@ for outcome, paths in datasets_models.items():
         test_metrics["Outcome"] = outcome
         test_results.append(test_metrics)
 
-# Save fold-level CV results to a CSV file
+
 cv_fold_results_df = pd.DataFrame(cv_fold_results)
 cv_fold_results_csv_path = "brier/cv_outcomes/cv_fold_metrics.csv"
 cv_fold_results_df.to_csv(cv_fold_results_csv_path, index=False)
 
-# Save test set results to another CSV file
+
 test_results_df = pd.DataFrame(test_results)
 test_results_csv_path = "brier/cv_outcomes/test_metrics.csv"
 test_results_df.to_csv(test_results_csv_path, index=False)
