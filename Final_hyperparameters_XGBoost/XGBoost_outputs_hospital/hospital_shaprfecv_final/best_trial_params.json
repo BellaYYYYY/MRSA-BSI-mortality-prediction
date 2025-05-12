@@ -1,0 +1,17 @@
+{
+  "verbosity": 0,
+  "scale_pos_weight": 1.5967871485943774,
+  "random_state": 123,
+  "booster": "gbtree",
+  "n_jobs": -1,
+  "objective": "binary:logistic",
+  "lambda": 0.0001226990137780836,
+  "alpha": 0.002695250118756945,
+  "colsample_bytree": 0.9160921781833559,
+  "subsample": 0.5176611380439072,
+  "learning_rate": 0.013500473356756299,
+  "n_estimators": 524,
+  "max_depth": 6,
+  "min_child_weight": 3,
+  "gamma": 6.869528566559606e-08
+}
