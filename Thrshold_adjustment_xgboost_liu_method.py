@@ -7,7 +7,7 @@ from xgboost import XGBClassifier
 from sklearn.model_selection import RepeatedStratifiedKFold, RepeatedKFold
 from sklearn.metrics import (
     roc_curve, accuracy_score, f1_score, recall_score, 
-    precision_score, confusion_matrix, roc_auc_score, brier_score_loss
+    precision_score, confusion_matrix, roc_auc_score
 )
 from sklearn.base import clone
 
@@ -42,8 +42,6 @@ def get_metrics(y_true, probabilities, threshold=0.5):
         auc = roc_auc_score(y_true, probabilities)
     except ValueError:
         auc = np.nan 
-        
-    brier = brier_score_loss(y_true, probabilities)
     
     return {
         'Threshold': threshold,
@@ -53,8 +51,7 @@ def get_metrics(y_true, probabilities, threshold=0.5):
         'Specificity': specificity,
         'Precision (PPV)': precision,
         'NPV': npv,
-        'ROC AUC': auc,
-        'Brier Score': brier
+        'ROC AUC': auc
     }
 
 def run_one_fold(fold_idx, train_index, val_index, X_train, y_train, model, model_name):
@@ -176,7 +173,7 @@ def main():
         
     if all_results:
         results_df = pd.DataFrame(all_results)
-        cols = ['Model Path', 'Target', 'Adjustment', 'Threshold', 'Accuracy', 'F1 Score', 'Recall (Sensitivity)', 'Specificity', 'Precision (PPV)', 'NPV', 'ROC AUC', 'Brier Score']
+        cols = ['Model Path', 'Target', 'Adjustment', 'Threshold', 'Accuracy', 'F1 Score', 'Recall (Sensitivity)', 'Specificity', 'Precision (PPV)', 'NPV', 'ROC AUC']
         cols = [c for c in cols if c in results_df.columns]
         results_df = results_df[cols]
         
