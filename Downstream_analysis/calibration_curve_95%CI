@@ -137,7 +137,7 @@ def bootstrap_confidence_interval(y_true, y_pred, n_bootstrap=5000, alpha=0.05):
     
     return lb_fp, ub_fp, lb_oe, ub_oe, lb_mean_oe, ub_mean_oe
 
-def create_calibration_curves(output_dir="brier/calibration_curves"):
+def create_calibration_curves(output_dir="calibration_curves"):
     os.makedirs(os.path.join(output_dir, "data"), exist_ok=True)
     all_calibration_data = []
 
@@ -208,7 +208,7 @@ def create_calibration_curves(output_dir="brier/calibration_curves"):
             os.path.join(output_dir, "all_calibration_data.csv"), index=False
         )
 
-def create_combined_plot(output_dir="brier/calibration_curves"):
+def create_combined_plot(output_dir="calibration_curves"):
     data_dir = os.path.join(output_dir, "data")
     fig, axs = plt.subplots(2, 2, figsize=(20, 16), sharex=True, sharey=True)
     axs = axs.flatten()
