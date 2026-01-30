@@ -1,0 +1,136 @@
+import numpy as np
+import pandas as pd
+from joblib import load
+from sklearn.metrics import roc_auc_score
+from scipy.stats import norm
+from statsmodels.stats.multitest import multipletests
+from sklearn.base import BaseEstimator, TransformerMixin
+
+class PostProcessingImputer(BaseEstimator, TransformerMixin):
+    def __init__(self):
+        self.lab_prefixes_ = ['df_bili', 'df_crea', 'df_plate']
+
+    def fit(self, X, y=None):
+        return self
+
+    def transform(self, X):
+        X = X.copy()
+        for pref in self.lab_prefixes_:
+            last = f"{pref}_Lab Result of Last Timepoint"
+            first = f"{pref}_Lab Result of First Timepoint"
+            diff = f"{pref}_Last - First"
+            
+            if first in X.columns and diff in X.columns:
+                if last in X.columns:
+                    mask_last = X[last].isna() & X[first].notna() & X[diff].notna()
+                    X.loc[mask_last, last] = X.loc[mask_last, first] + X.loc[mask_last, diff]
+                else:
+                    X[last] = X[first] + X[diff]
+        return X
+
+def delong_roc_variance(y_true, pred):
+    y_true = np.array(y_true)
+    pred = np.array(pred)
+    m = sum(y_true == 1)
+    n = sum(y_true == 0)
+    pos = pred[y_true == 1]
+    neg = pred[y_true == 0]
+    
+    v10 = np.array([np.sum(p > neg) + 0.5 * np.sum(p == neg) for p in pos]) / n
+    v01 = np.array([np.sum(pos > n_val) + 0.5 * np.sum(pos == n_val) for n_val in neg]) / m
+    return v10, v01, m, n
+
+def get_auc_ci(y_true, pred, alpha=0.95):
+    auc = roc_auc_score(y_true, pred)
+    v10, v01, m, n = delong_roc_variance(y_true, pred)
+    
+    var = np.var(v10, ddof=1) / m + np.var(v01, ddof=1) / n
+    se = np.sqrt(var)
+    
+    z = norm.ppf(1 - (1 - alpha) / 2)
+    lower = auc - z * se
+    upper = auc + z * se
+    
+    ci_str = f"{auc:.3f} ({lower:.3f}-{upper:.3f})"
+    return auc, lower, upper, ci_str
+
+def compare_two_models(y_true, pred1, pred2):
+    auc1 = roc_auc_score(y_true, pred1)
+    auc2 = roc_auc_score(y_true, pred2)
+    
+    v10_1, v01_1, m, n = delong_roc_variance(y_true, pred1)
+    v10_2, v01_2, m, n = delong_roc_variance(y_true, pred2)
+    
+    s11 = np.var(v10_1, ddof=1)/m + np.var(v01_1, ddof=1)/n
+    s22 = np.var(v10_2, ddof=1)/m + np.var(v01_2, ddof=1)/n
+    s12 = np.cov(v10_1, v10_2)[0,1]/m + np.cov(v01_1, v01_2)[0,1]/n
+    
+    var = s11 + s22 - 2*s12
+    if var <= 0:
+        return auc1, auc2, 1.0
+        
+    z = (auc1 - auc2) / np.sqrt(var)
+    p = 2 * norm.sf(np.abs(z))
+    return auc1, auc2, p
+
+outcomes = ["Mortality_28day", "Mortality_90day", "Mortality_1year"]
+model_paths = {
+    "XGB": {
+        "Mortality_28day": "all_final_model/xgb_fs/xgb_fs_28d_noweight.joblib",
+        "Mortality_90day": "all_final_model/xgb_fs/xgb_fs_90d_noweight.joblib",
+        "Mortality_1year": "all_final_model/xgb_fs/xgb_fs_1y_noweight.joblib"
+    },
+    "RF": {
+        "Mortality_28day": "all_final_model/rf/FS_28d.joblib",
+        "Mortality_90day": "all_final_model/rf/FS_90d.joblib",
+        "Mortality_1year": "all_final_model/rf/FS_1y.joblib"
+    },
+    "MLP": {
+        "Mortality_28day": "all_final_model/mlp/mlp_28d_final.joblib",
+        "Mortality_90day": "all_final_model/mlp/mlp_90d_final.joblib",
+        "Mortality_1year": "all_final_model/mlp/mlp_1y_final.joblib"
+    }
+}
+
+test_df = pd.read_csv("datasets/train_test_202511_80/test.csv")
+all_results = []
+
+for outcome in outcomes:
+    print(f"Processing {outcome}...")
+    y_true = test_df[outcome].values
+    
+    probs = {}
+    model_cis = {}
+    for m_name in ["XGB", "RF", "MLP"]:
+        model = load(model_paths[m_name][outcome])
+        feats = model.feature_names_in_
+        probs[m_name] = model.predict_proba(test_df[feats])[:, 1]
+        
+        _, _, _, ci_str = get_auc_ci(y_true, probs[m_name])
+        model_cis[m_name] = ci_str
+    
+    pairs = [("XGB", "RF"), ("XGB", "MLP"), ("RF", "MLP")]
+    outcome_results = []
+    
+    for m1, m2 in pairs:
+        auc1, auc2, p_raw = compare_two_models(y_true, probs[m1], probs[m2])
+        outcome_results.append({
+            "Outcome": outcome,
+            "Comparison": f"{m1} vs {m2}",
+            "Model1_AUC_95CI": model_cis[m1],
+            "Model2_AUC_95CI": model_cis[m2],
+            "P_Raw": p_raw
+        })
+    
+    raw_ps = [res["P_Raw"] for res in outcome_results]
+    _, adj_ps, _, _ = multipletests(raw_ps, method='bonferroni')
+    
+    for i in range(len(outcome_results)):
+        outcome_results[i]["P_Adj"] = adj_ps[i]
+        outcome_results[i]["Significant"] = adj_ps[i] < 0.05
+        
+    all_results.extend(outcome_results)
+
+results_df = pd.DataFrame(all_results)
+results_df.to_csv("delong_results/delong_test_comparison.csv", index=False)
+print(results_df.to_string())
