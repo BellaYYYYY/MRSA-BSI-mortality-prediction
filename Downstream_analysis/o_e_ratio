@@ -1,0 +1,238 @@
+import pandas as pd
+import os
+import numpy as np
+from joblib import load
+import xgboost as xgb
+import logging
+from sklearn.base import BaseEstimator, TransformerMixin
+
+np.random.seed(68)
+
+class PostProcessingImputer(BaseEstimator, TransformerMixin):
+    def __init__(self):
+        self.lab_prefixes_ = ['df_bili', 'df_crea', 'df_plate']
+
+    def fit(self, X, y=None):
+        return self
+
+    def transform(self, X):
+        X = X.copy()
+        for pref in self.lab_prefixes_:
+            last = f"{pref}_Lab Result of Last Timepoint"
+            first = f"{pref}_Lab Result of First Timepoint"
+            diff = f"{pref}_Last - First"
+            
+            if first in X.columns and diff in X.columns:
+                if last in X.columns:
+                    mask_last = X[last].isna() & X[first].notna() & X[diff].notna()
+                    X.loc[mask_last, last] = X.loc[mask_last, first] + X.loc[mask_last, diff]
+                else:
+                    X[last] = X[first] + X[diff]
+        return X
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('expected_deaths.log')
+    ]
+)
+logger = logging.getLogger(__name__)
+
+def load_model_safely(model_path, model_type):
+    if model_type.startswith('xgb'):
+        try:
+            model = xgb.Booster()
+            model.load_model(model_path)
+            logger.info(f"Loaded {model_type} Booster from {model_path}")
+            return model
+        except Exception:
+            model = load(model_path)
+            logger.info(f"Loaded {model_type} model via joblib from {model_path}")
+            return model
+    model = load(model_path)
+    logger.info(f"Loaded {model_type} model from {model_path}")
+    return model
+
+def get_predictions(model, X):
+    if hasattr(model, "predict_proba"): return model.predict_proba(X)[:, 1]
+    if isinstance(model, xgb.Booster): return model.predict(xgb.DMatrix(X))
+    raise ValueError("Model format not supported")
+
+def get_model_features(model, X_test):
+    try:
+        if hasattr(model, "feature_names_in_"):
+            return list(model.feature_names_in_)
+        elif hasattr(model, "get_booster") and hasattr(model.get_booster(), "feature_names"):
+            return model.get_booster().feature_names
+        elif isinstance(model, xgb.Booster) and hasattr(model, "feature_names"):
+            return model.feature_names
+        elif hasattr(model, "steps"):
+            for name, step in model.steps:
+                if hasattr(step, "features") and step.features is not None:
+                    return list(step.features)
+                if hasattr(step, "feature_names_in_"):
+                    return list(step.feature_names_in_)
+        return list(X_test.columns)
+    except Exception as e:
+        logger.warning(f"Error getting feature names: {str(e)}")
+        return list(X_test.columns)
+
+datasets_models = {
+    "28d": {
+        "test_data_path": "datasets/train_test_202511_80/test.csv",
+        "target_column": "Mortality_28day",
+        "display_name": "28-Day Mortality",
+        "models": {
+            "xgb": {"path": "all_final_model/xgb_fs/xgb_fs_28d_noweight.joblib", "threshold": 0.2046869397163391},
+            "xgb_nofs": {"path": "all_final_model/xgb_nofs/xgb_nofs_28d_noweight.joblib", "threshold": 0.21642395853996277},
+            "rf": {"path": "all_final_model/rf/FS_28d.joblib", "threshold": 0.25901160065414247},
+            "mlp": {"path": "all_final_model/mlp/mlp_28d_final.joblib", "threshold": 0.2149},
+        }
+    },
+
+    "90d": {
+        "test_data_path": "datasets/train_test_202511_80/test.csv",
+        "target_column": "Mortality_90day",
+        "display_name": "90-Day Mortality",
+        "models": {
+            "xgb": {"path": "all_final_model/xgb_fs/xgb_fs_90d_noweight.joblib", "threshold": 0.4125136137008667},
+            "xgb_nofs": {"path": "all_final_model/xgb_nofs/xgb_nofs_90d_noweight.joblib", "threshold": 0.38069629669189453},
+            "rf": {"path": "all_final_model/rf/FS_90d.joblib", "threshold": 0.4330111349917687},
+            "mlp": {"path": "all_final_model/mlp/mlp_90d_final.joblib", "threshold": 0.3887},
+        }
+    },
+
+    "1year": {
+        "test_data_path": "datasets/train_test_202511_80/test.csv",
+        "target_column": "Mortality_1year",
+        "display_name": "1-Year Mortality",
+        "models": {
+            "xgb": {"path": "all_final_model/xgb_fs/xgb_fs_1y_noweight.joblib", "threshold": 0.6003286242485046},
+            "xgb_nofs": {"path": "all_final_model/xgb_nofs/xgb_nofs_1y_noweight.joblib", "threshold": 0.5707617998123169},
+            "rf": {"path": "all_final_model/rf/FS_1y.joblib", "threshold": 0.5958411029896016},
+            "mlp": {"path": "all_final_model/mlp/mlp_1y_final.joblib", "threshold": 0.6078},
+        }
+    }
+}
+
+outcome_display = {
+    "28d": "28-Day Mortality",
+    "90d": "90-Day Mortality",
+    "1year": "1-Year Mortality"
+}
+
+model_info = {
+    "xgb": {"display_name": "XGBoost", "color": "#1f77b4", "marker": "o", "line_style": "-"},
+    "rf": {"display_name": "Random Forest", "color": "#2ca02c", "marker": "s", "line_style": "-"},
+    "mlp": {"display_name": "MLP", "color": "#d62728", "marker": "^", "line_style": "-"}
+}
+
+def bootstrap_oe_ratio(y_true, y_probas, n_bootstrap=5000, alpha=0.05):
+    bootstrapped_oe_ratios = []
+    n_samples = len(y_true)
+    
+    y_true_arr = np.array(y_true)
+    y_probas_arr = np.array(y_probas)
+    
+    for _ in range(n_bootstrap):
+        indices = np.random.choice(n_samples, size=n_samples, replace=True)
+        y_true_resampled = y_true_arr[indices]
+        y_probas_resampled = y_probas_arr[indices]
+        
+        obs = np.sum(y_true_resampled)
+        exp = np.sum(y_probas_resampled)
+        
+        if exp > 0:
+            bootstrapped_oe_ratios.append(obs / exp)
+    
+    if not bootstrapped_oe_ratios:
+        return np.nan, np.nan, np.nan
+        
+    mean_oe = np.mean(bootstrapped_oe_ratios)
+    lower_ci = np.percentile(bootstrapped_oe_ratios, (alpha / 2) * 100)
+    upper_ci = np.percentile(bootstrapped_oe_ratios, (1 - alpha / 2) * 100)
+    
+    return mean_oe, lower_ci, upper_ci
+
+os.makedirs("expected_deaths_results", exist_ok=True)
+
+expected_deaths_results = []
+
+for outcome, paths in datasets_models.items():
+    print(f"Processing outcome: {outcome_display[outcome]}")
+    
+    try:
+        test_df = pd.read_csv(paths["test_data_path"])
+        actual_deaths = test_df[paths["target_column"]].sum()
+        total_samples = len(test_df)
+        
+        print(f"  Test set samples: {total_samples}")
+        print(f"  Expected deaths ({outcome_display[outcome]}): {actual_deaths}")
+        print("-" * 60)
+        
+        outcome_results = {
+            "Outcome": outcome,
+            "Outcome_Display": outcome_display[outcome],
+            "Total_Samples": total_samples,
+            "Observed_Deaths": actual_deaths
+        }
+
+        for model_type in ["xgb", "rf", "mlp"]:
+            if model_type not in paths["models"]:
+                logger.warning(f"Model {model_type} not available for outcome {outcome}.")
+                continue
+            
+            try:
+                model_config = paths["models"][model_type]
+                model_path = model_config["path"]
+                model = load_model_safely(model_path, model_type)
+
+                features = get_model_features(model, test_df.drop(columns=[paths["target_column"]]))
+                X_test = test_df[features]
+                
+                y_probas = get_predictions(model, X_test)
+                
+                total_expected_deaths = np.sum(y_probas)
+                mean_predicted_mortality = np.mean(y_probas)
+                
+                mean_oe, lower_oe, upper_oe = bootstrap_oe_ratio(test_df[paths["target_column"]], y_probas)
+                
+                threshold = model_config.get("threshold")
+                y_preds = (y_probas >= threshold).astype(int)
+                total_predicted_deaths = np.sum(y_preds)
+                
+                outcome_results[f"Expected_Deaths_{model_type.upper()}"] = total_expected_deaths
+                outcome_results[f"OE_Ratio_{model_type.upper()}"] = mean_oe
+                outcome_results[f"OE_Ratio_Lower_{model_type.upper()}"] = lower_oe
+                outcome_results[f"OE_Ratio_Upper_{model_type.upper()}"] = upper_oe
+                outcome_results[f"Mean_Predicted_Prob_{model_type.upper()}"] = mean_predicted_mortality
+                outcome_results[f"Predicted_Deaths_{model_type.upper()}"] = total_predicted_deaths
+                outcome_results[f"Threshold_{model_type.upper()}"] = threshold
+                
+                logger.info(f'  Model: {model_info[model_type]["display_name"]}')
+                logger.info(f'    Threshold: {threshold:.3f}')
+                logger.info(f'    Expected Deaths (Sum of Probs): {total_expected_deaths:.2f}')
+                logger.info(f'    O/E Ratio: {mean_oe:.3f} (95% CI: {lower_oe:.3f}-{upper_oe:.3f})')
+                logger.info(f'    Predicted Deaths (Binary at Threshold): {total_predicted_deaths}')
+                logger.info(f'    Mean Predicted Prob: {mean_predicted_mortality:.3f}')
+
+            except Exception as e:
+                logger.error(f"Error processing {model_type} for {outcome_display[outcome]}: {str(e)}")
+                outcome_results[f"Expected_Deaths_{model_type.upper()}"] = np.nan
+                outcome_results[f"Predicted_Deaths_{model_type.upper()}"] = np.nan
+
+        expected_deaths_results.append(outcome_results)
+        
+    except Exception as e:
+        print(f"Error loading test data or calculating deaths for {outcome_display[outcome]}: {e}")
+        print("-" * 60)
+        continue
+
+if expected_deaths_results:
+    results_df = pd.DataFrame(expected_deaths_results)
+    results_df.to_csv("expected_deaths_results/expected_deaths_summary.csv", index=False)
+    
+    print("\nAnalysis complete! Results saved to:")
+    print("- Summary CSV: expected_deaths_results/expected_deaths_summary.csv")
