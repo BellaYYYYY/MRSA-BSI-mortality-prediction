@@ -1,0 +1,259 @@
+#!/usr/bin/env python3
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import os
+from joblib import load
+import xgboost as xgb
+from sklearn.calibration import calibration_curve
+from sklearn.base import BaseEstimator, TransformerMixin
+
+class PostProcessingImputer(BaseEstimator, TransformerMixin):
+    def __init__(self):
+        self.lab_prefixes_ = ['df_bili', 'df_crea', 'df_plate']
+    def fit(self, X, y=None): return self
+    def transform(self, X):
+        X = X.copy()
+        for pref in self.lab_prefixes_:
+            last = f"{pref}_Lab Result of Last Timepoint"
+            first = f"{pref}_Lab Result of First Timepoint"
+            diff = f"{pref}_Last - First"
+            if all(c in X.columns for c in [last, first, diff]):
+                mask = X[last].isna() & X[first].notna() & X[diff].notna()
+                X.loc[mask, last] = X.loc[mask, first] + X.loc[mask, diff]
+        return X
+
+datasets_models = {
+    "28d": {
+        "test_data_path": "datasets/train_test_202511_80/test.csv",
+        "target_column": "Mortality_28day",
+        "display_name": "28-Day Mortality",
+        "models": {
+            "xgb": "all_final_model/xgb_fs/xgb_fs_28d_noweight.joblib",
+            "rf": "all_final_model/rf/FS_28d.joblib",
+            "mlp": "all_final_model/mlp/mlp_28d_final.joblib",
+        }
+    },
+    "90d": {
+        "test_data_path": "datasets/train_test_202511_80/test.csv",
+        "target_column": "Mortality_90day",
+        "display_name": "90-Day Mortality",
+        "models": {
+            "xgb": "all_final_model/xgb_fs/xgb_fs_90d_noweight.joblib",
+            "rf": "all_final_model/rf/FS_90d.joblib",
+            "mlp": "all_final_model/mlp/mlp_90d_final.joblib",
+        }
+    },
+    "1year": {
+        "test_data_path": "datasets/train_test_202511_80/test.csv",
+        "target_column": "Mortality_1year",
+        "display_name": "1-Year Mortality",
+        "models": {
+            "xgb": "all_final_model/xgb_fs/xgb_fs_1y_noweight.joblib",
+            "rf": "all_final_model/rf/FS_1y.joblib",
+            "mlp": "all_final_model/mlp/mlp_1y_final.joblib",
+        }
+    }
+}
+
+model_info = {
+    "xgb": {"display_name": "XGBoost", "color": "blue", "marker": "o", "line_style": "-"},
+    "rf": {"display_name": "Random Forest", "color": "green", "marker": "s", "line_style": "-"},
+    "mlp": {"display_name": "MLP", "color": "red", "marker": "^", "line_style": "-"}
+}
+
+def get_model_features(model, X_test):
+    if hasattr(model, "steps") or hasattr(model, "named_steps"):
+        named_steps = getattr(model, "named_steps", dict(model.steps))
+        if 'final_prep' in named_steps and hasattr(named_steps['final_prep'], 'get_feature_names_out'):
+            return list(named_steps['final_prep'].get_feature_names_out())
+        
+        for step in named_steps.values():
+            if hasattr(step, "feature_names_in_"):
+                return list(step.feature_names_in_)
+
+    if hasattr(model, "feature_names_in_"):
+        return list(model.feature_names_in_)
+    
+    if hasattr(model, "get_booster"):
+        booster = model.get_booster()
+        if hasattr(booster, "feature_names"):
+            return booster.feature_names
+
+    if hasattr(model, "feature_names") and not isinstance(model, pd.DataFrame):
+        return model.feature_names
+    
+    print(f"Warning: Could not determine features for {type(model)}, using all columns.")
+    return list(X_test.columns)
+
+def get_predictions(model, X, model_type):
+    if hasattr(model, "predict_proba"):
+        return model.predict_proba(X)[:, 1]
+    elif isinstance(model, xgb.Booster):
+        return model.predict(xgb.DMatrix(X))
+    else:
+        raise ValueError(f"Model {model_type} doesn't support probability predictions")
+
+def bootstrap_confidence_interval(y_true, y_pred, n_bootstrap=5000, alpha=0.05):
+    frac_pos_full, mean_pred_full = calibration_curve(y_true, y_pred, n_bins=10, strategy='uniform')
+    n_bins = len(frac_pos_full)
+    
+    boot_frac_pos = np.full((n_bootstrap, n_bins), np.nan)
+    boot_oe = np.full((n_bootstrap, n_bins), np.nan)
+    boot_mean_oe = np.full(n_bootstrap, np.nan)
+
+    for i in range(n_bootstrap):
+        indices = np.random.choice(len(y_true), size=len(y_true), replace=True)
+        y_t = y_true.iloc[indices] if hasattr(y_true, 'iloc') else y_true[indices]
+        y_p = y_pred[indices]
+        
+        fp, mp = calibration_curve(y_t, y_p, n_bins=10, strategy='uniform')
+        
+        current_len = len(fp)
+        if current_len <= n_bins:
+            boot_frac_pos[i, :current_len] = fp
+            
+            epsilon = 1e-10
+            oe = fp / np.maximum(mp, epsilon)
+            boot_oe[i, :current_len] = oe
+            boot_mean_oe[i] = np.mean(oe)
+
+    valid_mask = ~np.isnan(boot_frac_pos).all(axis=1)
+    if not valid_mask.any():
+        return np.zeros(n_bins), np.zeros(n_bins), np.zeros(n_bins), np.zeros(n_bins), 0.0, 0.0
+
+    boot_frac_pos = boot_frac_pos[valid_mask]
+    boot_oe = boot_oe[valid_mask]
+    boot_mean_oe = boot_mean_oe[valid_mask]
+
+    lb_fp = np.nanpercentile(boot_frac_pos, alpha / 2 * 100, axis=0)
+    ub_fp = np.nanpercentile(boot_frac_pos, (1 - alpha / 2) * 100, axis=0)
+    
+    lb_oe = np.nanpercentile(boot_oe, alpha / 2 * 100, axis=0)
+    ub_oe = np.nanpercentile(boot_oe, (1 - alpha / 2) * 100, axis=0)
+    
+    lb_mean_oe = np.nanpercentile(boot_mean_oe, alpha / 2 * 100)
+    ub_mean_oe = np.nanpercentile(boot_mean_oe, (1 - alpha / 2) * 100)
+    
+    return lb_fp, ub_fp, lb_oe, ub_oe, lb_mean_oe, ub_mean_oe
+
+def create_calibration_curves(output_dir="brier/calibration_curves"):
+    os.makedirs(os.path.join(output_dir, "data"), exist_ok=True)
+    all_calibration_data = []
+
+    for outcome_key, data in datasets_models.items():
+        print(f"Processing: {outcome_key}")
+        
+        test_df = pd.read_csv(data["test_data_path"])
+        y_test = test_df[data["target_column"]]
+        
+        plt.figure(figsize=(12, 9))
+        plt.plot([0, 1], [0, 1], 'k--', lw=2, label='Perfectly calibrated')
+        
+        for model_type, model_path in data["models"].items():
+            if not os.path.exists(model_path):
+                print(f"Skipping missing model: {model_path}")
+                continue
+
+            model = load(model_path)
+            features = get_model_features(model, test_df)
+            y_probas = get_predictions(model, test_df[features], model_type)
+            
+            frac_pos, mean_pred = calibration_curve(y_test, y_probas, n_bins=10, strategy='uniform')
+            lb_fp, ub_fp, lb_oe, ub_oe, lb_moe, ub_moe = bootstrap_confidence_interval(y_test, y_probas)
+            
+            pfx = os.path.join(output_dir, "data", f"{outcome_key}_{model_type}")
+            np.save(f"{pfx}_mean_pred.npy", mean_pred)
+            np.save(f"{pfx}_frac_pos.npy", frac_pos)
+            np.save(f"{pfx}_lower_frac_pos.npy", lb_fp)
+            np.save(f"{pfx}_upper_frac_pos.npy", ub_fp)
+
+            epsilon = 1e-10
+            oe_ratio = frac_pos / np.maximum(mean_pred, epsilon)
+            
+            row_df = pd.DataFrame({
+                'mean_predicted_probability': mean_pred,
+                'fraction_of_positives': frac_pos,
+                'lower_bound_95ci': lb_fp,
+                'upper_bound_95ci': ub_fp,
+                'bin_number': np.arange(len(mean_pred)) + 1,
+                'o_e_ratio_per_bin': oe_ratio,
+                'lower_bound_o_e_95ci': lb_oe,
+                'upper_bound_o_e_95ci': ub_oe,
+                'mean_o_e_ratio_overall': np.mean(oe_ratio),
+                'lower_bound_mean_o_e_95ci': lb_moe,
+                'upper_bound_mean_o_e_95ci': ub_moe,
+                'outcome': outcome_key,
+                'model_type': model_type
+            })
+            all_calibration_data.append(row_df)
+            
+            info = model_info[model_type]
+            plt.plot(mean_pred, frac_pos, f"{info['marker']}{info['line_style']}", 
+                     lw=2, color=info["color"], label=info["display_name"])
+            plt.fill_between(mean_pred, lb_fp, ub_fp, color=info["color"], alpha=0.1)
+
+        plt.xlabel('Mean predicted probability', fontsize=16)
+        plt.ylabel('Fraction of positives (Observed probability)', fontsize=16)
+        plt.title(f'Calibration Curve - {data["display_name"]}', fontsize=18, fontweight='bold')
+        plt.legend(loc='upper center', bbox_to_anchor=(0.5, -0.1), ncol=4, fontsize=14)
+        plt.tick_params(axis='both', which='major', labelsize=18)
+        plt.xlim([0.0, 1.0])
+        plt.ylim([0.0, 1.0])
+        plt.savefig(os.path.join(output_dir, f"calibration_curve_{outcome_key}.png"), dpi=300, bbox_inches='tight')
+        plt.close()
+
+    if all_calibration_data:
+        pd.concat(all_calibration_data, ignore_index=True).to_csv(
+            os.path.join(output_dir, "all_calibration_data.csv"), index=False
+        )
+
+def create_combined_plot(output_dir="brier/calibration_curves"):
+    data_dir = os.path.join(output_dir, "data")
+    fig, axs = plt.subplots(2, 2, figsize=(20, 16), sharex=True, sharey=True)
+    axs = axs.flatten()
+    
+    outcomes = [k for k in ["hospital", "28d", "90d", "1year"] if k in datasets_models]
+    
+    for idx, outcome in enumerate(outcomes):
+        ax = axs[idx]
+        data = datasets_models[outcome]
+        ax.plot([0, 1], [0, 1], 'k--', lw=2, label='Perfectly calibrated' if idx == 0 else "")
+        ax.set_title(f'{data["display_name"]} Mortality', fontsize=16, fontweight='bold')
+
+        for model_type in ["xgb", "rf", "mlp"]:
+            if model_type not in data["models"]: continue
+            
+            pfx = os.path.join(data_dir, f"{outcome}_{model_type}")
+            if not os.path.exists(f"{pfx}_mean_pred.npy"): continue
+            
+            mp = np.load(f"{pfx}_mean_pred.npy")
+            fp = np.load(f"{pfx}_frac_pos.npy")
+            lb = np.load(f"{pfx}_lower_frac_pos.npy")
+            ub = np.load(f"{pfx}_upper_frac_pos.npy")
+            
+            info = model_info[model_type]
+            label = info['display_name'] if idx == 0 else ""
+            ax.plot(mp, fp, f"{info['marker']}{info['line_style']}", lw=2, color=info["color"], label=label)
+            ax.fill_between(mp, lb, ub, color=info["color"], alpha=0.1)
+
+        ax.set_xlim([0.0, 1.0])
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.spines['bottom'].set_linewidth(2)
+        ax.spines['left'].set_linewidth(2)
+        ax.tick_params(labelsize=12)
+        if idx >= 2: ax.set_xlabel('Mean predicted probability', fontsize=14)
+        if idx % 2 == 0: ax.set_ylabel('Fraction of positives (Observed probability)', fontsize=14)
+
+    for i in range(len(outcomes), len(axs)): axs[i].axis('off')
+
+    handles, labels = axs[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc='upper center', bbox_to_anchor=(0.5, 0.98), fancybox=True, shadow=True, ncol=4, fontsize=16)
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    plt.savefig(os.path.join(output_dir, "combined_calibration_curves.tiff"), dpi=300, bbox_inches='tight')
+    plt.close()
+
+if __name__ == "__main__":
+    create_calibration_curves()
+    create_combined_plot()
